@@ -21,6 +21,7 @@ import json
 import urllib.request
 import pickle
 import tarfile
+import hashlib
 
 torch.set_num_threads(4) # this affects: matrix multiplication, convolutions, batchnorm, relu, etc.
 
@@ -74,15 +75,36 @@ class CNN(nn.Module):
 
 # download data
 def download_and_extract_cifar10(dest="./data"):
+
     url = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
-    filepath = os.path.join(dest, "cifar-10-python.tar.gz")
-    if not os.path.exists(dest):
-        os.makedirs(dest)
+    filename="cifar-10-python.tar.gz"
+    filepath = os.path.join(dest, filename)
+
+    def is_valid_tar_gz(filepath):
+        try:
+            with tarfile.open(filepath, "r:gz") as tar:
+                tar.getmembers() 
+            return True
+        except Exception:
+            return False
+        
+    if os.path.exists(filepath):
+        print("File already exists. Checking integrity...")
+        if not is_valid_tar_gz(filepath):
+            print("Corrupted file detected. Removing and re-downloading...")
+            os.remove(filepath)
+        else:
+            print("File appears valid. Skipping download.")
+
     if not os.path.exists(filepath):
         print("Downloading CIFAR-10 dataset...")
         urllib.request.urlretrieve(url, filepath)
+        print("Download complete.")
+
+    print("Extracting CIFAR-10 dataset...")
     with tarfile.open(filepath, "r:gz") as tar:
         tar.extractall(path=dest)
+    print("Extraction complete.")
 
 # load data 
 def load_cifar10_from_pickle(path="./data/cifar-10-batches-py"):
@@ -125,14 +147,16 @@ def load_data():
     return train_loader, test_loader, load_time
 
 # ====== Train ======
-def train_model(model, train_loader, device):
+def train_model(model, train_loader, test_loader, device, criterion):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     model.train()
 
     start_train = time.time()
     for epoch in range(EPOCHS):
-        running_loss = 0.0
+        epoch_start=time.time()
+        running_loss, correct, total = 0.0, 0, 0
+
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -141,15 +165,30 @@ def train_model(model, train_loader, device):
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-        avg_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}", flush=True)
+
+            _, predicted = torch.max(outputs, 1)
+            correct += (predicted == labels).sum().item()
+            total += labels.size(0)
+
+
+        train_acc = correct/total
+        train_loss = running_loss / len(train_loader)
+        val_loss, val_acc, _, _ = evaluate_model(model, test_loader, device, criterion)
+        epoch_time = time.time() - epoch_start
+
+        print(f"Epoch {epoch+1} | "
+              f" train loss: {train_loss:.4f} | train acc: {train_acc:.4f} |"
+              f" val_loss: {val_loss:.4f} | val acc: {val_acc:.4f} | "
+              f" Time: {epoch_time:.2f}s")
+        
     train_time = time.time() - start_train
     return train_time
 
 # ====== Evaluation ======
-def evaluate_model(model, test_loader, device):
+def evaluate_model(model, test_loader, device, criterion):
     model.eval()
     correct, total = 0, 0
+    val_loss = 0.0
     all_preds, all_labels = [], []
     sample_images, sample_preds = [], []
 
@@ -157,16 +196,24 @@ def evaluate_model(model, test_loader, device):
         for i, (inputs, labels) in enumerate(test_loader):
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
             _, predicted = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+
+            val_loss += loss.item() * inputs.size(0) 
 
             if i == 0:
                 sample_images = inputs.cpu()[:8]
                 sample_preds = predicted.cpu()[:8]
 
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    avg_loss = val_loss / total
     accuracy = correct / total
-    return accuracy, sample_images, sample_preds
+    return avg_loss, accuracy, sample_images, sample_preds
 
 # ====== Save Sample Images ======
 def save_sample_images(images, preds, output_dir):
@@ -193,11 +240,18 @@ def main():
     print("Initializing improved model...", flush=True)
     model = CNN().to(device)
 
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    num_params = count_parameters(model)
+    print(f"Total trainable parameters: {num_params:,}")
+
+    criterion = nn.CrossEntropyLoss()
+
     print("Training model...", flush=True)
-    train_time = train_model(model, train_loader, device)
+    train_time = train_model(model, train_loader, test_loader, device, criterion)
 
     print("Evaluating model...", flush=True)
-    accuracy, sample_images, sample_preds = evaluate_model(model, test_loader, device)
+    test_loss, accuracy, sample_images, sample_preds = evaluate_model(model, test_loader, device, criterion)
 
     print("Saving outputs...", flush=True)
     save_sample_images(sample_images, sample_preds, OUTPUT_DIR)
@@ -205,6 +259,7 @@ def main():
     metrics = {
         "data_loading_time": load_time,
         "training_time": train_time,
+        "final_test_loss": test_loss,
         "accuracy": accuracy
     }
     with open(os.path.join(OUTPUT_DIR, "metrics.json"), 'w') as f:
@@ -213,7 +268,6 @@ def main():
     print(f"Data Loading Time: {load_time:.2f} seconds", flush=True)
     print(f"Training Time: {train_time:.2f} seconds", flush=True)
     print(f"Test Accuracy: {accuracy * 100:.2f}%", flush=True)
-    print("Done.", flush=True)
 
 if __name__ == "__main__":
     main()
